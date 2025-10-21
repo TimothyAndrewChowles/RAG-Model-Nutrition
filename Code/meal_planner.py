@@ -29,7 +29,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
 
-# Nutrient fields we care about for planning/summary.
+# Nutrient fields we care about for planning/summary
 NUTRIENT_KEYS = [
     "KCAL_Value",
     "TotalFat_Gram",

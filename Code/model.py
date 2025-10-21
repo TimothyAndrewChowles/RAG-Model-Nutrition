@@ -199,10 +199,16 @@ class MenuRAG:
             meal = doc.metadata["meal"]
             date = doc.metadata["date"]
             protein = doc.nutrients["Protein_Gram"]
+            carb = doc.nutrients["TotalCarb_Gram"]
+            fat = doc.nutrients["TotalFat_Gram"]
             kcal = doc.nutrients["KCAL_Value"]
             lines.append(
-                f"- {name} (served {date} at {meal}): {protein:.1f} g protein, {kcal:.0f} kcal. "
-                f"Allergens: {doc.metadata.get('allergens', 'see ingredients')}."
+                f"- {name} (served {date} at {meal}):\n"
+                f"  Protein: {protein:.1f} g\n"
+                f"  Carbs: {carb:.1f} g\n"
+                f"  Fat: {fat:.1f} g\n"
+                f"  Calories: {kcal:.0f} kcal\n"
+                f"  Allergens: {doc.metadata.get('allergens', 'see ingredients')}.\n"
             )
         return "\n".join(lines)
 

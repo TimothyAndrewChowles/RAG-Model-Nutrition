@@ -27,8 +27,10 @@ class MenuExplorerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("NetNutrition Menu Explorer")
-        self.geometry("820x600")
-        self.minsize(720, 520)
+        self.geometry("960x660")
+        self.minsize(820, 560)
+
+        self._configure_styles()
 
         default_dir = build_default_menu_dir()
         self.menu_dir_var = tk.StringVar(value=str(default_dir) if default_dir else "")
@@ -43,71 +45,281 @@ class MenuExplorerApp(tk.Tk):
 
         self._build_widgets()
 
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        base_bg = "#f5f5f7"
+        surface_bg = "#ffffff"
+        accent = "#0a84ff"
+        text_primary = "#1c1c1e"
+        text_secondary = "#6e6e73"
+        subtle_border = "#d2d2d7"
+
+        self._theme = {
+            "base_bg": base_bg,
+            "surface_bg": surface_bg,
+            "accent": accent,
+            "text_primary": text_primary,
+            "text_secondary": text_secondary,
+            "subtle_border": subtle_border,
+        }
+
+        self.configure(background=base_bg)
+        style.configure(".", background=base_bg, foreground=text_primary)
+        style.configure("App.TFrame", background=base_bg)
+        style.configure("Hero.TFrame", background=base_bg)
+        style.configure("Card.TFrame", background=surface_bg, relief="flat", borderwidth=1, bordercolor=subtle_border)
+        style.configure("Card.TLabelframe", background=surface_bg, bordercolor=subtle_border, relief="flat")
+        style.configure(
+            "Card.TLabelframe.Label",
+            background=surface_bg,
+            foreground=text_primary,
+            font=(".AppleSystemUIFont", 12, "bold"),
+        )
+        style.configure(
+            "Title.TLabel",
+            font=(".AppleSystemUIFont", 22, "bold"),
+            foreground=text_primary,
+            background=base_bg,
+        )
+        style.configure(
+            "Subtitle.TLabel",
+            font=(".AppleSystemUIFont", 12),
+            foreground=text_secondary,
+            background=base_bg,
+        )
+        style.configure(
+            "Section.TLabel",
+            font=(".AppleSystemUIFont", 14, "semibold"),
+            foreground=text_primary,
+            background=surface_bg,
+        )
+        style.configure("Status.TLabel", font=(".AppleSystemUIFont", 11), foreground=text_secondary, background=base_bg)
+
+        style.configure(
+            "Accent.TButton",
+            background=accent,
+            foreground="#ffffff",
+            font=(".AppleSystemUIFont", 12, "semibold"),
+            borderwidth=0,
+            focusthickness=3,
+            focuscolor=accent,
+            padding=(14, 8),
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("disabled", "#b7d7ff"), ("pressed", "#0060df"), ("active", "#358bfd")],
+            foreground=[("disabled", "#f5faff")],
+        )
+
+        style.configure(
+            "Secondary.TButton",
+            background="#e4ebf5",
+            foreground=accent,
+            font=(".AppleSystemUIFont", 12),
+            borderwidth=0,
+            padding=(14, 8),
+        )
+        style.map(
+            "Secondary.TButton",
+            background=[("pressed", "#d4deee"), ("active", "#dde6f4")],
+            foreground=[("disabled", "#a0b3c8")],
+        )
+
+        style.configure(
+            "TEntry",
+            fieldbackground=surface_bg,
+            foreground=text_primary,
+            bordercolor=subtle_border,
+            lightcolor=subtle_border,
+            darkcolor=subtle_border,
+            insertcolor=text_primary,
+            padding=6,
+            relief="flat",
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=surface_bg,
+            background=surface_bg,
+            bordercolor=subtle_border,
+            foreground=text_primary,
+            arrowsize=16,
+        )
+        style.configure(
+            "TSpinbox",
+            fieldbackground=surface_bg,
+            bordercolor=subtle_border,
+            foreground=text_primary,
+            arrowsize=14,
+        )
+
+        style.configure(
+            "Card.Vertical.TScrollbar",
+            troughcolor=surface_bg,
+            bordercolor=surface_bg,
+            background="#dadde6",
+            arrowsize=12,
+        )
+        style.map(
+            "Card.Vertical.TScrollbar",
+            background=[("pressed", "#b6bdcb"), ("active", "#c8cdd8"), ("!active", "#dadde6")],
+            arrowcolor=[("active", accent), ("!active", "#86868b")],
+        )
+
+        style.configure("TNotebook", background=base_bg, tabposition="n", borderwidth=0)
+        style.configure(
+            "TNotebook.Tab",
+            font=(".AppleSystemUIFont", 12),
+            padding=(18, 10),
+            background=base_bg,
+            borderwidth=0,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", surface_bg), ("active", surface_bg)],
+            foreground=[("selected", text_primary), ("!selected", text_secondary)],
+        )
+
+        self.option_add("*TCombobox*Listbox.font", ".AppleSystemUIFont 12")
+        self.option_add("*Font", ".AppleSystemUIFont 12")
+        self.option_add("*TButton.padding", 6)
+        self.option_add("*TEntry.padding", 6)
+        self.option_add("*TEntry.font", ".AppleSystemUIFont 12")
+        self.option_add("*TEntry.borderWidth", 1)
+        self.option_add("*TEntry.relief", "flat")
+
     def _build_widgets(self) -> None:
-        root_frame = ttk.Frame(self, padding=12)
+        theme = getattr(self, "_theme", {})
+        surface_bg = theme.get("surface_bg", "#ffffff")
+        text_primary = theme.get("text_primary", "#1c1c1e")
+        text_secondary = theme.get("text_secondary", "#6e6e73")
+
+        root_frame = ttk.Frame(self, padding=22, style="App.TFrame")
         root_frame.pack(fill=tk.BOTH, expand=True)
 
-        notebook = ttk.Notebook(root_frame)
-        notebook.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        hero = ttk.Frame(root_frame, style="Hero.TFrame")
+        hero.pack(fill=tk.X, pady=(0, 18))
 
-        # Directory selector lives above the tabs.
-        dir_frame = ttk.Frame(root_frame)
-        dir_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(hero, text="NetNutrition Navigator", style="Title.TLabel").pack(anchor=tk.W)
+        ttk.Label(
+            hero,
+            text="Explore dining menus, surface nutrition insights, and build personalized meal plans.",
+            style="Subtitle.TLabel",
+        ).pack(anchor=tk.W, pady=(4, 0))
 
-        ttk.Label(dir_frame, text="Menu directory:").pack(side=tk.LEFT)
-        dir_entry = ttk.Entry(dir_frame, textvariable=self.menu_dir_var)
-        dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        control_card = ttk.Frame(root_frame, style="Card.TFrame", padding=18)
+        control_card.pack(fill=tk.X, pady=(0, 16))
+
+        controls_grid = ttk.Frame(control_card, style="Card.TFrame")
+        controls_grid.pack(fill=tk.X)
+
+        ttk.Label(controls_grid, text="Menu directory", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        dir_entry = ttk.Entry(controls_grid, textvariable=self.menu_dir_var)
+        dir_entry.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self._interactive_widgets.append(dir_entry)
 
-        browse_button = ttk.Button(dir_frame, text="Browse…", command=self._choose_directory)
-        browse_button.pack(side=tk.LEFT)
+        browse_button = ttk.Button(controls_grid, text="Browse…", style="Secondary.TButton", command=self._choose_directory)
+        browse_button.grid(row=1, column=3, padx=(12, 0))
         self._interactive_widgets.append(browse_button)
 
-        load_button = ttk.Button(dir_frame, text="Load Menus", command=self._load_menus_clicked)
-        load_button.pack(side=tk.LEFT, padx=(8, 0))
+        load_button = ttk.Button(
+            controls_grid,
+            text="Load Menus",
+            style="Accent.TButton",
+            command=self._load_menus_clicked,
+        )
+        load_button.grid(row=1, column=4, padx=(12, 0))
         self._interactive_widgets.append(load_button)
 
+        controls_grid.columnconfigure(0, weight=1)
+
+        notebook_card = ttk.Frame(root_frame, style="Card.TFrame", padding=18)
+        notebook_card.pack(fill=tk.BOTH, expand=True)
+
+        notebook = ttk.Notebook(notebook_card)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
         # Ask tab (MenuRAG search).
-        ask_tab = ttk.Frame(notebook, padding=10)
+        ask_tab = ttk.Frame(notebook, padding=2, style="Card.TFrame")
         notebook.add(ask_tab, text="Ask Questions")
 
-        self.question_entry = ttk.Entry(ask_tab)
+        ask_header = ttk.Frame(ask_tab, style="Card.TFrame")
+        ask_header.pack(fill=tk.X, padx=4, pady=(4, 8))
+
+        ttk.Label(ask_header, text="Ask the assistant", style="Section.TLabel").pack(anchor=tk.W)
+        ttk.Label(
+            ask_header,
+            text="Type a nutrition question, station lookup, or meal planning prompt.",
+            style="Subtitle.TLabel",
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        question_row = ttk.Frame(ask_tab, style="Card.TFrame")
+        question_row.pack(fill=tk.X, padx=4, pady=(0, 8))
+
+        self.question_entry = ttk.Entry(question_row)
         self.question_entry.insert(0, "What is a high protein food?")
-        self.question_entry.pack(fill=tk.X, padx=4, pady=(4, 0))
+        self.question_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._interactive_widgets.append(self.question_entry)
 
-        controls = ttk.Frame(ask_tab)
-        controls.pack(fill=tk.X, padx=4, pady=6)
+        ask_button = ttk.Button(
+            question_row,
+            text="Ask",
+            command=self._ask_clicked,
+            style="Accent.TButton",
+        )
+        ask_button.pack(side=tk.LEFT, padx=(12, 0))
+        self._interactive_widgets.append(ask_button)
 
-        ttk.Label(controls, text="Top results:").pack(side=tk.LEFT)
+        controls = ttk.Frame(ask_tab, style="Card.TFrame")
+        controls.pack(fill=tk.X, padx=4, pady=(0, 10))
+
+        ttk.Label(controls, text="Top results:", style="Subtitle.TLabel").pack(side=tk.LEFT)
         self.topk_spinbox = ttk.Spinbox(controls, from_=1, to=15, width=4, textvariable=self.topk_var)
         self.topk_spinbox.pack(side=tk.LEFT, padx=(4, 16))
         self._interactive_widgets.append(self.topk_spinbox)
 
-        ask_button = ttk.Button(controls, text="Ask", command=self._ask_clicked)
-        ask_button.pack(side=tk.LEFT)
-        self._interactive_widgets.append(ask_button)
-
-        high_protein_button = ttk.Button(controls, text="High protein picks", command=self._high_protein_clicked)
+        high_protein_button = ttk.Button(
+            controls, text="High protein picks", style="Secondary.TButton", command=self._high_protein_clicked
+        )
         high_protein_button.pack(side=tk.LEFT, padx=(8, 0))
         self._interactive_widgets.append(high_protein_button)
 
-        output_frame = ttk.Frame(ask_tab)
+        output_frame = ttk.Frame(ask_tab, style="Card.TFrame")
         output_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
-        self.output_text = tk.Text(output_frame, wrap=tk.WORD, state=tk.DISABLED)
+        self.output_text = tk.Text(
+            output_frame,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            font=(".AppleSystemUIFont", 12),
+            background=surface_bg,
+            foreground=text_primary,
+            insertbackground=text_primary,
+            highlightthickness=1,
+            highlightcolor=theme.get("subtle_border", "#d2d2d7"),
+            highlightbackground=theme.get("subtle_border", "#d2d2d7"),
+            bd=0,
+            relief=tk.FLAT,
+            padx=14,
+            pady=14,
+        )
         self.output_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        scrollbar = ttk.Scrollbar(output_frame, command=self.output_text.yview)
+        scrollbar = ttk.Scrollbar(output_frame, command=self.output_text.yview, orient=tk.VERTICAL)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.output_text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.configure(style="Card.Vertical.TScrollbar")
 
         # Analytics tab.
-        analytics_tab = ttk.Frame(notebook, padding=10)
+        analytics_tab = ttk.Frame(notebook, padding=2, style="Card.TFrame")
         notebook.add(analytics_tab, text="Nutrition Dashboard")
 
-        filters_frame = ttk.LabelFrame(analytics_tab, text="Filters")
-        filters_frame.pack(fill=tk.X, expand=False, pady=(0, 10))
+        filters_frame = ttk.LabelFrame(analytics_tab, text="Filters", style="Card.TLabelframe", padding=16)
+        filters_frame.pack(fill=tk.X, expand=False, pady=(0, 12), padx=4)
 
         row1 = ttk.Frame(filters_frame)
         row1.pack(fill=tk.X, padx=8, pady=(8, 4))
@@ -154,15 +366,30 @@ class MenuExplorerApp(tk.Tk):
             ]
         )
 
-        summary_frame = ttk.LabelFrame(analytics_tab, text="Summary")
-        summary_frame.pack(fill=tk.BOTH, expand=True)
+        summary_frame = ttk.LabelFrame(analytics_tab, text="Summary", style="Card.TLabelframe", padding=16)
+        summary_frame.pack(fill=tk.BOTH, expand=True, padx=4)
 
-        self.dashboard_text = tk.Text(summary_frame, wrap=tk.WORD, state=tk.DISABLED)
-        self.dashboard_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.dashboard_text = tk.Text(
+            summary_frame,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            font=(".AppleSystemUIFont", 12),
+            background=surface_bg,
+            foreground=text_primary,
+            insertbackground=text_primary,
+            highlightthickness=1,
+            highlightcolor=theme.get("subtle_border", "#d2d2d7"),
+            highlightbackground=theme.get("subtle_border", "#d2d2d7"),
+            bd=0,
+            relief=tk.FLAT,
+            padx=14,
+            pady=14,
+        )
+        self.dashboard_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         # Status bar.
-        status_bar = ttk.Label(root_frame, textvariable=self.status_var, anchor=tk.W)
-        status_bar.pack(fill=tk.X, pady=(6, 0))
+        status_bar = ttk.Label(root_frame, textvariable=self.status_var, anchor=tk.W, style="Status.TLabel")
+        status_bar.pack(fill=tk.X, pady=(12, 0))
 
     def _choose_directory(self) -> None:
         selection = filedialog.askdirectory(title="Select menu directory", initialdir=self.menu_dir_var.get())

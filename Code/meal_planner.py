@@ -2,34 +2,48 @@
 """
 Station meal-planning assistant for NetNutrition exports.
 
-This script builds a simple AI-style planning model that selects combinations of
-menu items for each meal in a date range so that the resulting calories and
-macros land close to configurable targets.  It relies exclusively on the
-provided NetNutrition XLSX files – no hard-coded foods.
+This script builds a smart planner that balances calories, macros, allergens,
+and personalization settings for every meal in a date range.  It relies on
+NetNutrition XLSX exports and can cache normalized data for faster re-runs.
 
 Example
 -------
-python code.py \
+python Code/meal_planner.py \
     --menu-file "../Dining Food Info/Station 9 10.20.25-10.26.25.xlsx" \
     --start-date 2025-10-27 \
     --end-date 2025-11-02 \
-    --daily-calories 1600 \
-    --macro-split 50 20 30 \
-    --station-name "Station 9"
+    --daily-calories 2000 \
+    --macro-split 45 30 25 \
+    --meal-split Breakfast=30 Lunch=40 Dinner=30 \
+    --exclude-allergens milk peanuts \
+    --prefer-keyword veggie \
+    --max-repeat-per-week 2 \
+    --alternates 2 \
+    --output json
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+try:
+    import pulp  # type: ignore
+except ImportError as exc:  # pragma: no cover - surfaces clearer guidance.
+    raise ImportError(
+        "The meal planner requires 'pulp' (https://pypi.org/project/PuLP/). "
+        "Install with `pip install pulp` and retry."
+    ) from exc
 
-# Nutrient fields we care about for planning/summary.
+
+# Nutrient fields used for planning/summary.
 NUTRIENT_KEYS = [
     "KCAL_Value",
     "TotalFat_Gram",
@@ -47,38 +61,49 @@ DEFAULT_MEAL_SPLIT = {
     "Dinner": 0.35,
 }
 
+# Columns that may contain station names depending on the export template.
+STATION_COLUMNS = ("Station", "StationName", "Station_Name", "Concept", "Restaurant")
 
-@dataclass(frozen=True)
-class MenuItem:
-    """Structured view of a single NetNutrition menu item."""
-
-    name: str
-    service_course: str
-    serving_g: float
-    nutrients: Dict[str, float]
-    ingredients: Optional[str]
-    allergens: Optional[str]
-
-    def scaled_nutrients(self, servings: int) -> Dict[str, float]:
-        return {k: v * servings for k, v in self.nutrients.items()}
+# Cache folder for normalized menus.
+CACHE_ROOT = Path(__file__).resolve().parent / ".cache"
 
 
-def load_menu(path: Path) -> pd.DataFrame:
-    """Load a NetNutrition export into a normalized DataFrame."""
+def _cache_path(src: Path) -> Path:
+    CACHE_ROOT.mkdir(exist_ok=True)
+    hash_key = hashlib.sha1(f"{src.resolve()}::{src.stat().st_mtime_ns}".encode("utf-8")).hexdigest()
+    return CACHE_ROOT / f"{hash_key}.parquet"
+
+
+def load_menu(path: Path, *, use_cache: bool = True) -> pd.DataFrame:
+    """
+    Load a NetNutrition export into a normalized DataFrame.
+
+    The first call for a given file is cached as Parquet to skip repeated XLSX parsing.
+    """
+    if use_cache:
+        cache_path = _cache_path(path)
+        if cache_path.exists():
+            return pd.read_parquet(cache_path)
+
     df = pd.read_excel(path)
     df = df.rename(columns=lambda c: c.strip().replace(" ", "_"))
+    if "LabelDate" not in df.columns:
+        raise ValueError("Expected a 'LabelDate' column in the NetNutrition export.")
     df["LabelDate"] = pd.to_datetime(df["LabelDate"]).dt.date
 
-    # Normalize allergens to basic strings.
-    df["Allergens"] = df["Allergens"].fillna("").replace({"nan": "", "NaN": ""})
-    df["Allergens"] = df["Allergens"].apply(lambda val: val if val else "none listed")
+    df["Allergens"] = df.get("Allergens", "").fillna("").replace({"nan": "", "NaN": ""})
+    df["Allergens"] = df["Allergens"].apply(lambda val: val.strip() if val else "none listed")
 
-    # Fill NaNs in key numeric fields with zeros to simplify math.
     for key in NUTRIENT_KEYS:
         if key in df.columns:
             df[key] = pd.to_numeric(df[key], errors="coerce").fillna(0.0)
+        else:
+            df[key] = 0.0
 
     df["ServingGramWgt"] = pd.to_numeric(df.get("ServingGramWgt"), errors="coerce").fillna(0.0)
+    if use_cache:
+        cache_path = _cache_path(path)
+        df.to_parquet(cache_path, index=False)
     return df
 
 
@@ -106,10 +131,80 @@ def compute_macro_targets(meal_targets: Dict[str, float], macro_split: Tuple[int
     return results
 
 
+def normalize_meal_split(raw_split: Optional[Sequence[str]]) -> Dict[str, float]:
+    """
+    Convert CLI strings like ["Breakfast=30", "Lunch=40", "Dinner=30"] into
+    fractions that sum to 1.0.  Defaults to DEFAULT_MEAL_SPLIT.
+    """
+    if not raw_split:
+        return DEFAULT_MEAL_SPLIT.copy()
+
+    meal_split: Dict[str, float] = {}
+    for chunk in raw_split:
+        if "=" not in chunk:
+            raise ValueError(f"Meal split '{chunk}' must look like Breakfast=35.")
+        meal, val = chunk.split("=", 1)
+        try:
+            pct = float(val)
+        except ValueError as exc:
+            raise ValueError(f"Meal split '{chunk}' is not numeric.") from exc
+        meal_split[meal.strip()] = pct
+
+    total = sum(meal_split.values())
+    if total <= 0:
+        raise ValueError("Meal split percentages must sum to a positive number.")
+
+    return {meal: pct / total for meal, pct in meal_split.items()}
+
+
+def _tokenize_allergens(value: str) -> Tuple[str, ...]:
+    tokens = []
+    for piece in value.replace("/", ",").replace(";", ",").split(","):
+        piece = piece.strip().lower()
+        if piece:
+            tokens.append(piece)
+    return tuple(sorted(set(tokens)))
+
+
+@dataclass(frozen=True)
+class MenuItem:
+    """Structured view of a single NetNutrition menu item."""
+
+    name: str
+    meal: str
+    service_course: str
+    station: str
+    serving_g: float
+    nutrients: Dict[str, float]
+    ingredients: Optional[str]
+    allergens: Optional[str]
+    allergen_tokens: Tuple[str, ...] = field(default_factory=tuple)
+    search_blob: str = ""
+
+    def scaled_nutrients(self, servings: int) -> Dict[str, float]:
+        return {k: v * servings for k, v in self.nutrients.items()}
+
+
+@dataclass
+class PlannerConstraints:
+    """
+    Personalization and compliance switches for the meal planner.
+    """
+
+    exclude_allergens: Tuple[str, ...] = ()
+    include_keywords: Tuple[str, ...] = ()
+    exclude_keywords: Tuple[str, ...] = ()
+    station_filter: Optional[str] = None
+    meal_filter: Optional[Tuple[str, ...]] = None
+    max_repeat_per_week: Optional[int] = None
+    max_servings_per_item: int = 2
+    max_items_per_meal: int = 6
+    alternates: int = 1
+
+
 class MealPlannerModel:
     """
-    Lightweight heuristic planner that selects a combination of menu items
-    close to target calories/macros using greedy search with minor backtracking.
+    Optimization-backed planner that chooses servings close to macro targets.
     """
 
     def __init__(
@@ -118,187 +213,225 @@ class MealPlannerModel:
         daily_calories: int,
         meal_split: Dict[str, float],
         macro_split: Tuple[int, int, int],
-        max_servings: int = 2,
-        max_items: int = 6,
+        constraints: Optional[PlannerConstraints] = None,
     ) -> None:
         self.menu = menu
         self.daily_calories = daily_calories
         self.meal_split = meal_split
         self.macro_split = macro_split
-        self.max_servings = max_servings
-        self.max_items = max_items
+        self.constraints = constraints or PlannerConstraints()
 
         self.meal_calorie_targets = {
             meal: daily_calories * frac for meal, frac in meal_split.items()
         }
         self.macro_targets = compute_macro_targets(self.meal_calorie_targets, macro_split)
+        self._repeat_tracker: Dict[Tuple[int, int, str], int] = {}
 
-    def generate_plan(self, start_date, end_date) -> Dict:
+    def generate_plan(self, start_date: date, end_date: date) -> Dict[str, Dict]:
         days = pd.date_range(start=start_date, end=end_date, freq="D").date
-        plan = {}
+        plan: Dict[str, Dict] = {}
 
         for day in days:
-            day_plan = {}
-            day_totals = {key: 0.0 for key in NUTRIENT_KEYS}
-
             day_df = self.menu[self.menu["LabelDate"] == day]
             if day_df.empty:
-                plan[str(day)] = {"meals": day_plan, "daily_totals": day_totals}
+                plan[str(day)] = {"meals": {}, "daily_totals": {key: 0.0 for key in NUTRIENT_KEYS}}
                 continue
 
-            for meal_name in sorted(day_df["Meal"].unique()):
+            if self.constraints.station_filter:
+                station_df = None
+                for column in STATION_COLUMNS:
+                    if column in day_df.columns:
+                        station_df = day_df[day_df[column].fillna("").str.contains(self.constraints.station_filter, case=False, na=False)]
+                        break
+                day_df = station_df if station_df is not None else day_df
+
+            day_plan = {}
+            day_totals = {key: 0.0 for key in NUTRIENT_KEYS}
+            week_key = day.isocalendar()
+
+            meals = day_df["Meal"].dropna().unique()
+            if self.constraints.meal_filter:
+                meals = [m for m in meals if m in self.constraints.meal_filter]
+
+            for meal_name in sorted(meals):
                 if meal_name not in self.meal_split:
                     continue
-                meal_df = day_df[day_df["Meal"] == meal_name]
-                result = self._plan_single_meal(meal_df, meal_name)
-                day_plan[meal_name] = result
 
-                # Aggregate for daily totals.
+                meal_df = day_df[day_df["Meal"] == meal_name]
+                options = self._plan_with_alternates(meal_df, meal_name, week_key)
+                if not options:
+                    continue
+
+                day_plan[meal_name] = {
+                    "options": options,
+                    "target": self.macro_targets.get(meal_name, {}),
+                }
+                primary = options[0]
                 for key in NUTRIENT_KEYS:
-                    day_totals[key] += result["totals"].get(key, 0.0)
+                    day_totals[key] += primary["totals"].get(key, 0.0)
+                self._register_repeat(week_key, primary["items"])
 
             plan[str(day)] = {"meals": day_plan, "daily_totals": day_totals}
+
         return plan
 
-    def _plan_single_meal(self, meal_df: pd.DataFrame, meal_name: str) -> Dict:
-        items = self._extract_items(meal_df)
+    def _plan_with_alternates(self, meal_df: pd.DataFrame, meal_name: str, week_key) -> List[Dict]:
+        items = self._extract_items(meal_df, meal_name)
         if not items:
-            return {"items": [], "totals": {key: 0.0 for key in NUTRIENT_KEYS}}
+            return []
 
-        target = self.macro_targets.get(
-            meal_name,
-            {"KCAL_Value": self.daily_calories * (1 / 3), "TotalCarb_Gram": 0, "Protein_Gram": 0, "TotalFat_Gram": 0},
-        )
+        target = self.macro_targets.get(meal_name, {"KCAL_Value": self.daily_calories / 3})
+        blocked: set[str] = set()
+        options: List[Dict] = []
+        total_options = max(1, self.constraints.alternates + 1)
 
-        # Start from each entree (or every item if there are no entrees) and greedily improve.
-        entree_candidates = [item for item in items if item.service_course == "Entrees"]
-        base_candidates = entree_candidates or items
+        for _ in range(total_options):
+            option = self._solve_ilp(items, target, week_key, blocked)
+            if not option:
+                break
+            options.append(option)
 
-        best_state = None
-        best_score = float("inf")
+            # Remove the calorie-heaviest item for the next alternate to ensure diversity.
+            heaviest = max(option["items"], key=lambda item: item["nutrients"]["KCAL_Value"], default=None)
+            if heaviest:
+                blocked.add(heaviest["name"])
 
-        for seed in base_candidates:
-            state = {seed.name: 1}
-            totals = seed.scaled_nutrients(1)
-            score = self._score(totals, target)
+        return options
 
-            improved = True
-            while improved and sum(state.values()) < self.max_items:
-                improved = False
-                best_local = score
-                best_choice = None
+    def _solve_ilp(
+        self,
+        items: List[MenuItem],
+        target: Dict[str, float],
+        week_key,
+        blocked: set[str],
+    ) -> Optional[Dict]:
+        allowed: Dict[str, MenuItem] = {}
+        for item in items:
+            if item.name in blocked:
+                continue
+            allowance = self._remaining_allowance(week_key, item.name)
+            if allowance <= 0:
+                continue
+            allowed[item.name] = item
 
-                for item in items:
-                    if sum(state.values()) >= self.max_items and state.get(item.name, 0) == 0:
-                        continue
+        if not allowed:
+            return None
 
-                    if state.get(item.name, 0) >= self.max_servings:
-                        continue
+        problem = pulp.LpProblem("MealPlanner", pulp.LpMinimize)
+        serving_vars: Dict[str, pulp.LpVariable] = {}
 
-                    new_totals = {k: totals.get(k, 0.0) + item.nutrients.get(k, 0.0) for k in totals.keys()}
-                    new_score = self._score(new_totals, target)
+        for name, item in allowed.items():
+            cap = min(self.constraints.max_servings_per_item, self._remaining_allowance(week_key, name))
+            if cap <= 0:
+                continue
+            serving_vars[name] = pulp.LpVariable(f"serv_{hashlib.md5(name.encode()).hexdigest()[:6]}", lowBound=0, upBound=cap, cat="Integer")
 
-                    if new_score + 1e-6 < best_local:
-                        best_local = new_score
-                        best_choice = item
-                        best_totals = new_totals
+        if not serving_vars:
+            return None
 
-                if best_choice:
-                    state[best_choice.name] = state.get(best_choice.name, 0) + 1
-                    totals = best_totals  # type: ignore[name-defined]
-                    score = best_local
-                    improved = True
+        total_servings = pulp.lpSum(serving_vars.values())
+        problem += total_servings >= 1
+        problem += total_servings <= max(1, self.constraints.max_items_per_meal)
 
-            # Try pruning a single item if it helps.
-            state, totals, score = self._prune_once(state, items, totals, target, score)
+        objective_terms = []
+        weight_map = {
+            "KCAL_Value": 1.0,
+            "TotalCarb_Gram": 0.6,
+            "Protein_Gram": 0.9,
+            "TotalFat_Gram": 0.5,
+        }
+        totals_lookup: Dict[str, pulp.LpAffineExpression] = {}
 
-            if score < best_score:
-                best_score = score
-                best_state = (state, totals)
+        for nutrient, weight in weight_map.items():
+            expr = pulp.lpSum(var * allowed[name].nutrients.get(nutrient, 0.0) for name, var in serving_vars.items())
+            target_value = target.get(nutrient, 0.0)
+            pos = pulp.LpVariable(f"{nutrient}_pos", lowBound=0)
+            neg = pulp.LpVariable(f"{nutrient}_neg", lowBound=0)
+            problem += expr - target_value == pos - neg
+            objective_terms.append(weight * (pos + neg))
+            totals_lookup[nutrient] = expr
 
-        if not best_state:
-            best_state = ({base_candidates[0].name: 1}, base_candidates[0].scaled_nutrients(1))
+        # Gentle preference for keyword hits so toppings/veggies are not ignored.
+        keyword_weight = 0.05
+        if self.constraints.include_keywords:
+            lowered = tuple(kw.lower() for kw in self.constraints.include_keywords)
+        else:
+            lowered = ()
 
-        selection, totals = best_state
+        for name, var in serving_vars.items():
+            item = allowed[name]
+            prefer_hits = sum(1 for kw in lowered if kw in item.search_blob)
+            avoid_hits = sum(1 for kw in self.constraints.exclude_keywords if kw in item.search_blob)
+            if prefer_hits:
+                objective_terms.append(-keyword_weight * prefer_hits * var)
+            if avoid_hits:
+                objective_terms.append(keyword_weight * avoid_hits * var)
+
+        # Mild penalty on the number of servings to discourage over-selection.
+        objective_terms.append(0.01 * total_servings)
+
+        problem += pulp.lpSum(objective_terms)
+        solver = pulp.PULP_CBC_CMD(msg=False)
+        status = problem.solve(solver)
+        if pulp.LpStatus[status] != "Optimal":
+            return None
+
+        selection: Dict[str, int] = {}
+        for name, var in serving_vars.items():
+            qty = int(round(var.value() or 0))
+            if qty > 0:
+                selection[name] = qty
+
+        if not selection:
+            return None
+
+        totals = {key: 0.0 for key in NUTRIENT_KEYS}
+        payload_items = []
+        for name, count in selection.items():
+            item = allowed[name]
+            scaled = item.scaled_nutrients(count)
+            for key in totals.keys():
+                totals[key] += scaled.get(key, 0.0)
+            payload_items.append(
+                {
+                    "name": item.name,
+                    "servings": count,
+                    "nutrients": scaled,
+                    "ingredients": item.ingredients,
+                    "allergens": item.allergens,
+                    "service_course": item.service_course,
+                    "station": item.station,
+                }
+            )
 
         return {
-            "items": [
-                {
-                    "name": name,
-                    "servings": count,
-                    "nutrients": self._scaled_nutrients_lookup(items, name, count),
-                    "ingredients": self._ingredients_lookup(items, name),
-                    "allergens": self._allergens_lookup(items, name),
-                }
-                for name, count in sorted(selection.items())
-            ],
-            "totals": {key: totals.get(key, 0.0) for key in NUTRIENT_KEYS},
-            "target": target,
-            "score": best_score,
+            "items": sorted(payload_items, key=lambda itm: itm["name"]),
+            "totals": totals,
+            "score": self._score(totals, target),
         }
 
-    @staticmethod
-    def _ingredients_lookup(items: List[MenuItem], name: str) -> Optional[str]:
+    def _register_repeat(self, week_key, items: List[Dict]) -> None:
+        if not self.constraints.max_repeat_per_week:
+            return
+        week = (week_key.year, week_key.week)
         for item in items:
-            if item.name == name:
-                return item.ingredients
-        return None
+            key = (week[0], week[1], item["name"])
+            self._repeat_tracker[key] = self._repeat_tracker.get(key, 0) + item["servings"]
 
-    @staticmethod
-    def _allergens_lookup(items: List[MenuItem], name: str) -> Optional[str]:
-        for item in items:
-            if item.name == name:
-                return item.allergens
-        return None
+    def _remaining_allowance(self, week_key, item_name: str) -> int:
+        if not self.constraints.max_repeat_per_week:
+            return self.constraints.max_servings_per_item
+        week = (week_key.year, week_key.week)
+        key = (week[0], week[1], item_name)
+        used = self._repeat_tracker.get(key, 0)
+        return max(0, self.constraints.max_repeat_per_week - used)
 
-    @staticmethod
-    def _scaled_nutrients_lookup(items: List[MenuItem], name: str, count: int) -> Dict[str, float]:
-        for item in items:
-            if item.name == name:
-                return item.scaled_nutrients(count)
-        return {key: 0.0 for key in NUTRIENT_KEYS}
-
-    def _prune_once(
-        self,
-        state: Dict[str, int],
-        items: List[MenuItem],
-        totals: Dict[str, float],
-        target: Dict[str, float],
-        current_score: float,
-    ):
-        best_state = state
-        best_totals = totals
-        best_score = current_score
-
-        for name, count in list(state.items()):
-            if count <= 1:
-                continue
-            item = next((itm for itm in items if itm.name == name), None)
-            if not item:
-                continue
-
-            new_totals = {k: totals[k] - item.nutrients.get(k, 0.0) for k in totals.keys()}
-            new_state = state.copy()
-            new_state[name] = count - 1
-            if new_state[name] == 0:
-                del new_state[name]
-
-            new_score = self._score(new_totals, target)
-            if new_score + 1e-6 < best_score:
-                best_score = new_score
-                best_state = new_state
-                best_totals = new_totals
-
-        return best_state, best_totals, best_score
-
-    @staticmethod
-    def _score(totals: Dict[str, float], target: Dict[str, float]) -> float:
-        # Weighted relative error on calories + macros.
+    def _score(self, totals: Dict[str, float], target: Dict[str, float]) -> float:
         weights = {
             "KCAL_Value": 1.0,
-            "TotalCarb_Gram": 0.7,
+            "TotalCarb_Gram": 0.6,
             "Protein_Gram": 0.9,
-            "TotalFat_Gram": 0.6,
+            "TotalFat_Gram": 0.5,
         }
         error = 0.0
         for key, weight in weights.items():
@@ -310,30 +443,66 @@ class MealPlannerModel:
             error += weight * rel_err
         return error
 
-    def _extract_items(self, meal_df: pd.DataFrame) -> List[MenuItem]:
+    def _extract_items(self, meal_df: pd.DataFrame, meal_name: str) -> List[MenuItem]:
         items: List[MenuItem] = []
+        banned_allergens = tuple(allo.lower() for allo in self.constraints.exclude_allergens)
+        prefer_keywords = tuple(kw.lower() for kw in self.constraints.include_keywords)
+        avoid_keywords = tuple(kw.lower() for kw in self.constraints.exclude_keywords)
+
+        name_counts: Dict[str, int] = {}
 
         for _, row in meal_df.iterrows():
-            kcal = float(row.get("KCAL_Value", 0.0))
-            # Skip entries with essentially no nutritional contribution.
-            if kcal < 1:
+            nutrients = {key: float(row.get(key, 0.0)) for key in NUTRIENT_KEYS}
+            name = row.get("FormalName") or row.get("Recipe", "Unknown Item")
+            count = name_counts.get(name, 0) + 1
+            name_counts[name] = count
+            if count > 1:
+                name = f"{name} #{count}"
+            station = ""
+            for col in STATION_COLUMNS:
+                if col in row and pd.notna(row[col]):
+                    station = str(row[col])
+                    break
+            ingredients = row.get("Ingredients")
+            if isinstance(ingredients, float) and pd.isna(ingredients):
+                ingredients = None
+            allergens = row.get("Allergens", "none listed")
+            if isinstance(allergens, float) and pd.isna(allergens):
+                allergens = "none listed"
+            allergen_tokens = _tokenize_allergens(allergens if isinstance(allergens, str) else str(allergens))
+
+            if banned_allergens and any(allo in allergen_tokens for allo in banned_allergens):
                 continue
 
-            nutrients = {key: float(row.get(key, 0.0)) for key in NUTRIENT_KEYS}
+            text_blob = " ".join(
+                str(val).lower()
+                for val in (name, ingredients or "", station, row.get("ServiceCourse", ""), row.get("Recipe", ""))
+                if val
+            )
+            if avoid_keywords and any(kw in text_blob for kw in avoid_keywords):
+                continue
+            if prefer_keywords and not any(kw in text_blob for kw in prefer_keywords):
+                # Still keep it available but mark blob for objective preferences.
+                pass
+
             item = MenuItem(
-                name=row["FormalName"],
+                name=name,
+                meal=meal_name,
                 service_course=row.get("ServiceCourse", "Other"),
+                station=station,
                 serving_g=float(row.get("ServingGramWgt", 0.0)),
                 nutrients=nutrients,
-                ingredients=row.get("Ingredients"),
-                allergens=row.get("Allergens"),
+                ingredients=ingredients,
+                allergens=allergens,
+                allergen_tokens=allergen_tokens,
+                search_blob=text_blob,
             )
             items.append(item)
 
         return items
 
 
-def pretty_print_plan(plan: Dict, station_name: Optional[str]) -> str:
+def pretty_print_plan(plan: Dict[str, Dict], station_name: Optional[str]) -> str:
     lines: List[str] = []
     if station_name:
         lines.append(f"Station: {station_name}")
@@ -352,18 +521,20 @@ def pretty_print_plan(plan: Dict, station_name: Optional[str]) -> str:
         )
 
         for meal, details in payload["meals"].items():
-            totals = details["totals"]
+            options = details.get("options", [])
+            if not options:
+                lines.append(f"  {meal}: no viable plan.")
+                continue
+            primary = options[0]
+            totals = primary["totals"]
             lines.append(
                 f"  {meal}: {round(totals['KCAL_Value'])} kcal | "
                 f"{round(totals['TotalFat_Gram'])}g fat | "
                 f"{round(totals['TotalCarb_Gram'])}g carb | "
-                f"{round(totals['Protein_Gram'])}g protein | "
-                f"{round(totals['FiberTotalDietary_Gram'])}g fiber | "
-                f"{round(totals['SugarTotal_Gram'])}g sugar | "
-                f"{round(totals['Sodium_Milligram'])}mg sodium "
-                f"(score={details['score']:.3f})"
+                f"{round(totals['Protein_Gram'])}g protein "
+                f"(score={primary['score']:.3f})"
             )
-            for item in details["items"]:
+            for item in primary["items"]:
                 lines.append(
                     f"    - {item['servings']}× {item['name']} "
                     f"({round(item['nutrients']['KCAL_Value'])} kcal, "
@@ -371,12 +542,36 @@ def pretty_print_plan(plan: Dict, station_name: Optional[str]) -> str:
                     f"{round(item['nutrients']['Protein_Gram'])}g protein, "
                     f"{round(item['nutrients']['TotalFat_Gram'])}g fat)"
                 )
+            if len(options) > 1:
+                lines.append(f"    → {len(options) - 1} alternate option(s) available.")
 
     return "\n".join(lines)
 
 
+def plan_from_file(
+    menu_file: Path,
+    *,
+    start_date: date,
+    end_date: date,
+    daily_calories: int,
+    macro_split: Tuple[int, int, int],
+    meal_split: Dict[str, float],
+    constraints: PlannerConstraints,
+    use_cache: bool = True,
+) -> Dict[str, Dict]:
+    menu_df = load_menu(menu_file, use_cache=use_cache)
+    planner = MealPlannerModel(
+        menu=menu_df,
+        daily_calories=daily_calories,
+        meal_split=meal_split,
+        macro_split=macro_split,
+        constraints=constraints,
+    )
+    return planner.generate_plan(start_date=start_date, end_date=end_date)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="AI-style meal planner for NetNutrition station exports.")
+    parser = argparse.ArgumentParser(description="Optimization-based meal planner for NetNutrition station exports.")
     parser.add_argument(
         "--menu-file",
         type=Path,
@@ -388,8 +583,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--daily-calories",
         type=int,
-        default=1600,
-        help="Target calories per day used to set meal goals (default: 1600).",
+        default=1800,
+        help="Target calories per day used to set meal goals (default: 1800).",
     )
     parser.add_argument(
         "--macro-split",
@@ -400,10 +595,74 @@ def parse_args() -> argparse.Namespace:
         help="Macro percentage split for carbs/protein/fat (must sum to 100).",
     )
     parser.add_argument(
+        "--meal-split",
+        nargs="+",
+        metavar="MEAL=PCT",
+        help="Override the default meal split (e.g., Breakfast=25 Lunch=40 Dinner=35).",
+    )
+    parser.add_argument(
+        "--exclude-allergens",
+        nargs="*",
+        default=(),
+        help="Allergens to avoid entirely (space-separated list, e.g., milk peanuts).",
+    )
+    parser.add_argument(
+        "--prefer-keyword",
+        nargs="*",
+        default=(),
+        help="Ingredient/menu keywords to prioritize (case-insensitive).",
+    )
+    parser.add_argument(
+        "--avoid-keyword",
+        nargs="*",
+        default=(),
+        help="Keywords that should be filtered out from consideration.",
+    )
+    parser.add_argument(
+        "--station-filter",
+        default=None,
+        help="Restrict planning to stations matching this string.",
+    )
+    parser.add_argument(
+        "--meal-filter",
+        nargs="*",
+        default=None,
+        help="Restrict planning to these meals (e.g., Breakfast Lunch Dinner).",
+    )
+    parser.add_argument(
+        "--max-repeat-per-week",
+        type=int,
+        default=None,
+        help="Maximum number of times a menu item may appear per ISO week.",
+    )
+    parser.add_argument(
+        "--max-servings-per-item",
+        type=int,
+        default=2,
+        help="Upper bound for servings of a single item within one meal.",
+    )
+    parser.add_argument(
+        "--max-items-per-meal",
+        type=int,
+        default=6,
+        help="Upper bound on the number of servings picked for a meal.",
+    )
+    parser.add_argument(
+        "--alternates",
+        type=int,
+        default=1,
+        help="How many alternate options (per meal) to compute in addition to the primary plan.",
+    )
+    parser.add_argument(
         "--output",
         choices=("text", "json"),
         default="text",
         help="Output format for the final plan (default: text).",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable Parquet menu caching for this run.",
     )
     parser.add_argument(
         "--station-name",
@@ -420,17 +679,32 @@ def main() -> None:
     if macro_total != 100:
         raise ValueError("Macro split must sum to 100 (received %s)." % (args.macro_split,))
 
-    menu_df = load_menu(args.menu_file)
+    meal_split = normalize_meal_split(args.meal_split)
+    constraints = PlannerConstraints(
+        exclude_allergens=tuple(args.exclude_allergens),
+        include_keywords=tuple(args.prefer_keyword),
+        exclude_keywords=tuple(args.avoid_keyword),
+        station_filter=args.station_filter,
+        meal_filter=tuple(args.meal_filter) if args.meal_filter else None,
+        max_repeat_per_week=args.max_repeat_per_week,
+        max_servings_per_item=args.max_servings_per_item,
+        max_items_per_meal=args.max_items_per_meal,
+        alternates=max(0, args.alternates),
+    )
+
     start_date = pd.to_datetime(args.start_date).date()
     end_date = pd.to_datetime(args.end_date).date()
 
-    planner = MealPlannerModel(
-        menu=menu_df,
+    plan = plan_from_file(
+        args.menu_file,
+        start_date=start_date,
+        end_date=end_date,
         daily_calories=args.daily_calories,
-        meal_split=DEFAULT_MEAL_SPLIT,
         macro_split=tuple(args.macro_split),  # type: ignore[arg-type]
+        meal_split=meal_split,
+        constraints=constraints,
+        use_cache=not args.no_cache,
     )
-    plan = planner.generate_plan(start_date=start_date, end_date=end_date)
 
     if args.output == "json":
         print(json.dumps(plan, indent=2))

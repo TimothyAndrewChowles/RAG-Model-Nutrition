@@ -1,1 +1,7 @@
+pandas
+numpy
 sentence-transformers
+pulp
+pyarrow
+openpyxl
+pytest

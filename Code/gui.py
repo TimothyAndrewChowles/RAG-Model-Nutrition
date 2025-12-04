@@ -5,19 +5,23 @@ Tkinter desktop entry point for exploring NetNutrition exports.
 Tab 1 repeats the conversational search experience backed by MenuRAG.
 Tab 2 adds an analytics dashboard that summarizes calories/macros by date,
 meal, station, and allergen filters, with CSV export for downstream work.
+Tab 3 lets users run the optimization-based meal planner with personalization.
 """
 
 from __future__ import annotations
 
+import json
+import re
 import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 
+from meal_planner import DEFAULT_MEAL_SPLIT, MealPlannerModel, PlannerConstraints
 from model import MenuRAG, NUMERIC_KEYS, build_default_menu_dir, discover_menu_files, load_menus
 
 
@@ -42,6 +46,34 @@ class MenuExplorerApp(tk.Tk):
         self._dashboard_last_df: Optional[pd.DataFrame] = None
         self._loading = False
         self._interactive_widgets: list[tk.Widget] = []
+
+        self.planner_start_var = tk.StringVar()
+        self.planner_end_var = tk.StringVar()
+        self.planner_calories_var = tk.IntVar(value=1800)
+        self.planner_carb_var = tk.IntVar(value=50)
+        self.planner_protein_var = tk.IntVar(value=25)
+        self.planner_fat_var = tk.IntVar(value=25)
+        self._planner_meal_names = list(DEFAULT_MEAL_SPLIT.keys())
+        self.planner_meal_split_vars: Dict[str, tk.IntVar] = {
+            meal: tk.IntVar(value=int(DEFAULT_MEAL_SPLIT[meal] * 100)) for meal in self._planner_meal_names
+        }
+        self.planner_station_var = tk.StringVar(value="All")
+        self.planner_meal_filter_vars: Dict[str, tk.BooleanVar] = {
+            meal: tk.BooleanVar(value=True) for meal in self._planner_meal_names
+        }
+        self._planner_allergen_options = ["Milk", "Eggs", "Fish", "Shellfish", "Tree Nuts", "Peanuts", "Wheat", "Soy", "Sesame", "Gluten"]
+        self._planner_allergen_vars: Dict[str, tk.BooleanVar] = {
+            name: tk.BooleanVar(value=False) for name in self._planner_allergen_options
+        }
+        self.planner_prefer_var = tk.StringVar()
+        self.planner_avoid_var = tk.StringVar()
+        self.planner_max_repeat_var = tk.IntVar(value=2)
+        self.planner_max_servings_var = tk.IntVar(value=2)
+        self.planner_max_items_var = tk.IntVar(value=6)
+        self.planner_alternates_var = tk.IntVar(value=1)
+        self._planner_last_plan: Optional[Dict[str, Dict]] = None
+        self._planner_tree_payload: Dict[str, Dict] = {}
+        self.planner_summary_var = tk.StringVar(value="Run the meal planner to see personalized suggestions.")
 
         self._build_widgets()
 
@@ -387,9 +419,517 @@ class MenuExplorerApp(tk.Tk):
         )
         self.dashboard_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
+        # Meal planner tab.
+        planner_tab = ttk.Frame(notebook, padding=2, style="Card.TFrame")
+        notebook.add(planner_tab, text="Meal Planner")
+        self._build_planner_tab(planner_tab, surface_bg, text_primary, theme)
+
         # Status bar.
         status_bar = ttk.Label(root_frame, textvariable=self.status_var, anchor=tk.W, style="Status.TLabel")
         status_bar.pack(fill=tk.X, pady=(12, 0))
+
+    def _build_planner_tab(self, tab: ttk.Frame, surface_bg: str, text_primary: str, theme: Dict[str, str]) -> None:
+        header = ttk.Frame(tab, style="Card.TFrame")
+        header.pack(fill=tk.X, padx=4, pady=(4, 10))
+
+        ttk.Label(header, text="Personalized meal planner", style="Section.TLabel").pack(anchor=tk.W)
+        ttk.Label(
+            header,
+            text="Set calorie/macro targets, toggle allergens, and export multi-day plans.",
+            style="Subtitle.TLabel",
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        controls = ttk.LabelFrame(tab, text="Inputs", style="Card.TLabelframe", padding=14)
+        controls.pack(fill=tk.X, padx=4, pady=(0, 10))
+
+        date_row = ttk.Frame(controls)
+        date_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(date_row, text="Start:").pack(side=tk.LEFT)
+        self.planner_start_combo = ttk.Combobox(date_row, state="readonly", width=12, textvariable=self.planner_start_var)
+        self.planner_start_combo.pack(side=tk.LEFT, padx=(4, 18))
+        ttk.Label(date_row, text="End:").pack(side=tk.LEFT)
+        self.planner_end_combo = ttk.Combobox(date_row, state="readonly", width=12, textvariable=self.planner_end_var)
+        self.planner_end_combo.pack(side=tk.LEFT, padx=(4, 18))
+
+        ttk.Label(date_row, text="Station filter:").pack(side=tk.LEFT)
+        self.planner_station_combo = ttk.Combobox(date_row, state="readonly", width=22, textvariable=self.planner_station_var, values=["All"])
+        self.planner_station_combo.pack(side=tk.LEFT, padx=(4, 0))
+
+        macro_row = ttk.Frame(controls)
+        macro_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(macro_row, text="Daily calories:").pack(side=tk.LEFT)
+        calorie_spin = ttk.Spinbox(macro_row, from_=900, to=4000, increment=50, width=6, textvariable=self.planner_calories_var)
+        calorie_spin.pack(side=tk.LEFT, padx=(4, 12))
+
+        ttk.Label(macro_row, text="Macros (C/P/F %):").pack(side=tk.LEFT)
+        carb_spin = ttk.Spinbox(macro_row, from_=10, to=70, width=4, textvariable=self.planner_carb_var)
+        carb_spin.pack(side=tk.LEFT, padx=(4, 8))
+        protein_spin = ttk.Spinbox(macro_row, from_=10, to=60, width=4, textvariable=self.planner_protein_var)
+        protein_spin.pack(side=tk.LEFT, padx=(0, 8))
+        fat_spin = ttk.Spinbox(macro_row, from_=10, to=60, width=4, textvariable=self.planner_fat_var)
+        fat_spin.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(macro_row, text="Meal split % (B/L/D):").pack(side=tk.LEFT, padx=(12, 4))
+        meal_split_widgets: List[ttk.Widget] = []
+        for meal in self._planner_meal_names:
+            spin = ttk.Spinbox(macro_row, from_=0, to=100, width=4, textvariable=self.planner_meal_split_vars[meal])
+            spin.pack(side=tk.LEFT, padx=(2, 4))
+            meal_split_widgets.append(spin)
+
+        meal_row = ttk.Frame(controls)
+        meal_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(meal_row, text="Meals included:").pack(side=tk.LEFT)
+        for meal in self._planner_meal_names:
+            chk = ttk.Checkbutton(meal_row, text=meal, variable=self.planner_meal_filter_vars[meal])
+            chk.pack(side=tk.LEFT, padx=(4, 0))
+            self._interactive_widgets.append(chk)
+
+        allergen_frame = ttk.Frame(controls)
+        allergen_frame.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(allergen_frame, text="Allergen exclusions:").pack(anchor=tk.W)
+        allergen_row = ttk.Frame(allergen_frame)
+        allergen_row.pack(fill=tk.X)
+        for idx, name in enumerate(self._planner_allergen_options):
+            chk = ttk.Checkbutton(allergen_row, text=name, variable=self._planner_allergen_vars[name])
+            chk.grid(row=idx // 5, column=idx % 5, sticky="w", padx=4, pady=2)
+            self._interactive_widgets.append(chk)
+
+        keyword_row = ttk.Frame(controls)
+        keyword_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(keyword_row, text="Prefer keywords:").grid(row=0, column=0, sticky="w")
+        prefer_entry = ttk.Entry(keyword_row, textvariable=self.planner_prefer_var, width=32)
+        prefer_entry.grid(row=0, column=1, sticky="w", padx=(6, 18))
+        ttk.Label(keyword_row, text="Avoid keywords:").grid(row=0, column=2, sticky="w")
+        avoid_entry = ttk.Entry(keyword_row, textvariable=self.planner_avoid_var, width=32)
+        avoid_entry.grid(row=0, column=3, sticky="w", padx=(6, 0))
+
+        advanced_row = ttk.Frame(controls)
+        advanced_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(advanced_row, text="Max repeats/wk:").pack(side=tk.LEFT)
+        repeat_spin = ttk.Spinbox(advanced_row, from_=0, to=7, width=4, textvariable=self.planner_max_repeat_var)
+        repeat_spin.pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(advanced_row, text="Max servings/item:").pack(side=tk.LEFT)
+        servings_spin = ttk.Spinbox(advanced_row, from_=1, to=4, width=4, textvariable=self.planner_max_servings_var)
+        servings_spin.pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(advanced_row, text="Max items/meal:").pack(side=tk.LEFT)
+        items_spin = ttk.Spinbox(advanced_row, from_=2, to=12, width=4, textvariable=self.planner_max_items_var)
+        items_spin.pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(advanced_row, text="Alternates:").pack(side=tk.LEFT)
+        alt_spin = ttk.Spinbox(advanced_row, from_=0, to=3, width=4, textvariable=self.planner_alternates_var)
+        alt_spin.pack(side=tk.LEFT, padx=(4, 0))
+
+        button_row = ttk.Frame(controls)
+        button_row.pack(fill=tk.X, pady=(4, 0))
+        self.planner_run_button = ttk.Button(button_row, text="Generate plan", style="Accent.TButton", command=self._run_planner_clicked)
+        self.planner_run_button.pack(side=tk.LEFT)
+        self.planner_export_csv_button = ttk.Button(
+            button_row, text="Export CSV", style="Secondary.TButton", command=self._export_plan_csv, state=tk.DISABLED
+        )
+        self.planner_export_csv_button.pack(side=tk.LEFT, padx=(10, 0))
+        self.planner_export_json_button = ttk.Button(
+            button_row, text="Export JSON", style="Secondary.TButton", command=self._export_plan_json, state=tk.DISABLED
+        )
+        self.planner_export_json_button.pack(side=tk.LEFT, padx=(6, 0))
+
+        self._interactive_widgets.extend(
+            [
+                self.planner_start_combo,
+                self.planner_end_combo,
+                self.planner_station_combo,
+                calorie_spin,
+                carb_spin,
+                protein_spin,
+                fat_spin,
+                *meal_split_widgets,
+                prefer_entry,
+                avoid_entry,
+                repeat_spin,
+                servings_spin,
+                items_spin,
+                alt_spin,
+                self.planner_run_button,
+                self.planner_export_csv_button,
+                self.planner_export_json_button,
+            ]
+        )
+
+        results_frame = ttk.Frame(tab, style="Card.TFrame")
+        results_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
+        tree_container = ttk.Frame(results_frame, style="Card.TFrame")
+        tree_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        columns = ("kcal", "carb", "protein", "fat", "fiber", "sugar", "sodium", "notes")
+        self.planner_tree = ttk.Treeview(tree_container, columns=columns, show="tree headings", selectmode="browse")
+        self.planner_tree.heading("#0", text="Plan")
+        headings = {
+            "kcal": "kcal",
+            "carb": "carb(g)",
+            "protein": "protein(g)",
+            "fat": "fat(g)",
+            "fiber": "fiber(g)",
+            "sugar": "sugar(g)",
+            "sodium": "sodium(mg)",
+            "notes": "notes",
+        }
+        for col, text in headings.items():
+            self.planner_tree.heading(col, text=text)
+            self.planner_tree.column(col, width=90, stretch=False, anchor=tk.E)
+        self.planner_tree.column("notes", width=160, stretch=True, anchor=tk.W)
+        self.planner_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.planner_tree.bind("<<TreeviewSelect>>", self._on_plan_tree_select)
+
+        tree_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.planner_tree.yview)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.planner_tree.configure(yscrollcommand=tree_scroll.set)
+
+        detail_frame = ttk.LabelFrame(results_frame, text="Details", style="Card.TLabelframe", padding=12)
+        detail_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=(10, 0))
+        self.planner_detail_text = tk.Text(
+            detail_frame,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            width=34,
+            height=18,
+            background=surface_bg,
+            foreground=text_primary,
+            font=(".AppleSystemUIFont", 11),
+            highlightthickness=1,
+            highlightcolor=theme.get("subtle_border", "#d2d2d7"),
+            highlightbackground=theme.get("subtle_border", "#d2d2d7"),
+            bd=0,
+        )
+        self.planner_detail_text.pack(fill=tk.BOTH, expand=True)
+        self._set_planner_detail_text("Load menus and generate a plan to inspect ingredients and allergens.")
+
+        ttk.Label(tab, textvariable=self.planner_summary_var, style="Subtitle.TLabel").pack(anchor=tk.W, padx=4, pady=(4, 0))
+
+    def _set_planner_detail_text(self, message: str) -> None:
+        self.planner_detail_text.configure(state=tk.NORMAL)
+        self.planner_detail_text.delete("1.0", tk.END)
+        self.planner_detail_text.insert(tk.END, message)
+        self.planner_detail_text.configure(state=tk.DISABLED)
+
+    def _run_planner_clicked(self) -> None:
+        if self._loading:
+            return
+        if self._menu_df is None or self._menu_df.empty:
+            messagebox.showinfo("Load menus", "Load menus before running the planner.")
+            return
+        try:
+            plan_inputs = self._collect_planner_inputs()
+        except ValueError as exc:
+            messagebox.showerror("Invalid planner input", str(exc))
+            return
+
+        self._set_loading(True, message="Generating meal plan…")
+        thread = threading.Thread(target=self._planner_worker, args=(plan_inputs,), daemon=True)
+        thread.start()
+
+    def _collect_planner_inputs(self) -> Dict:
+        start_text = self.planner_start_var.get().strip()
+        end_text = self.planner_end_var.get().strip()
+        if not start_text or not end_text:
+            raise ValueError("Select a start and end date for the planner.")
+        try:
+            start_date = datetime.fromisoformat(start_text).date()
+            end_date = datetime.fromisoformat(end_text).date()
+        except ValueError as exc:
+            raise ValueError("Planner dates must be valid YYYY-MM-DD values.") from exc
+        if start_date > end_date:
+            raise ValueError("Planner start date must be on or before the end date.")
+
+        daily_calories = max(800, int(self.planner_calories_var.get()))
+        macro_split = (
+            int(self.planner_carb_var.get()),
+            int(self.planner_protein_var.get()),
+            int(self.planner_fat_var.get()),
+        )
+        if sum(macro_split) != 100:
+            raise ValueError("Macro percentages must sum to 100%.")
+
+        meal_split_raw = {meal: var.get() for meal, var in self.planner_meal_split_vars.items()}
+        meal_total = sum(meal_split_raw.values())
+        if meal_total <= 0:
+            raise ValueError("Set at least one meal split percentage above zero.")
+        meal_split = {meal: value / meal_total for meal, value in meal_split_raw.items() if value > 0}
+
+        meal_filters = [meal for meal, var in self.planner_meal_filter_vars.items() if var.get()]
+        meal_filter = tuple(meal_filters) if meal_filters and len(meal_filters) < len(self._planner_meal_names) else None
+
+        station_filter = self.planner_station_var.get().strip()
+        if station_filter.lower() == "all":
+            station_filter = ""
+
+        prefer_keywords = self._parse_keywords(self.planner_prefer_var.get())
+        avoid_keywords = self._parse_keywords(self.planner_avoid_var.get())
+        allergen_filters = tuple(
+            name.lower() for name, var in self._planner_allergen_vars.items() if var.get()
+        )
+
+        max_repeat = int(self.planner_max_repeat_var.get())
+        max_repeat_per_week = max_repeat if max_repeat > 0 else None
+        max_servings = max(1, int(self.planner_max_servings_var.get()))
+        max_items = max(2, int(self.planner_max_items_var.get()))
+        alternates = max(0, int(self.planner_alternates_var.get()))
+
+        constraints = PlannerConstraints(
+            exclude_allergens=allergen_filters,
+            include_keywords=tuple(prefer_keywords),
+            exclude_keywords=tuple(avoid_keywords),
+            station_filter=station_filter or None,
+            meal_filter=meal_filter,
+            max_repeat_per_week=max_repeat_per_week,
+            max_servings_per_item=max_servings,
+            max_items_per_meal=max_items,
+            alternates=alternates,
+        )
+
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "daily_calories": daily_calories,
+            "macro_split": macro_split,
+            "meal_split": meal_split,
+            "constraints": constraints,
+        }
+
+    @staticmethod
+    def _parse_keywords(raw: str) -> List[str]:
+        tokens = []
+        for chunk in re.split(r"[;,]", raw):
+            chunk = chunk.strip().lower()
+            if chunk:
+                tokens.append(chunk)
+        return tokens
+
+    def _planner_worker(self, plan_inputs: Dict) -> None:
+        try:
+            menu_df = self._menu_df.copy()
+            window_mask = (menu_df["LabelDate"] >= plan_inputs["start_date"]) & (menu_df["LabelDate"] <= plan_inputs["end_date"])
+            subset = menu_df[window_mask].copy()
+            if subset.empty:
+                raise ValueError("No menu data available for the selected date range.")
+            planner = MealPlannerModel(
+                menu=subset,
+                daily_calories=plan_inputs["daily_calories"],
+                meal_split=plan_inputs["meal_split"],
+                macro_split=plan_inputs["macro_split"],
+                constraints=plan_inputs["constraints"],
+            )
+            plan = planner.generate_plan(start_date=plan_inputs["start_date"], end_date=plan_inputs["end_date"])
+            self.after(0, lambda: self._on_planner_success(plan))
+        except Exception as exc:
+            self.after(0, lambda: self._on_planner_error(exc))
+
+    def _on_planner_success(self, plan: Dict[str, Dict]) -> None:
+        self._planner_last_plan = plan
+        self._render_planner_plan(plan)
+        day_count = len(plan)
+        self.planner_summary_var.set(f"Generated plans for {day_count} day(s). Export or refine filters above.")
+        self.planner_export_csv_button.configure(state=tk.NORMAL if plan else tk.DISABLED)
+        self.planner_export_json_button.configure(state=tk.NORMAL if plan else tk.DISABLED)
+        self._set_loading(False, message="Meal plan ready.")
+
+    def _on_planner_error(self, exc: Exception) -> None:
+        self._set_loading(False, message="Ready.")
+        messagebox.showerror("Meal planner failed", str(exc))
+
+    def _render_planner_plan(self, plan: Dict[str, Dict]) -> None:
+        if not hasattr(self, "planner_tree"):
+            return
+
+        for item in self.planner_tree.get_children():
+            self.planner_tree.delete(item)
+        self._planner_tree_payload.clear()
+        if not plan:
+            self._set_planner_detail_text("No meal plan available yet. Load menus and press Generate plan.")
+            return
+
+        for day in sorted(plan.keys()):
+            payload = plan[day]
+            totals = payload.get("daily_totals", {})
+            day_id = self.planner_tree.insert(
+                "",
+                tk.END,
+                text=day,
+                values=(
+                    self._format_value("KCAL_Value", totals),
+                    self._format_value("TotalCarb_Gram", totals),
+                    self._format_value("Protein_Gram", totals),
+                    self._format_value("TotalFat_Gram", totals),
+                    self._format_value("FiberTotalDietary_Gram", totals),
+                    self._format_value("SugarTotal_Gram", totals),
+                    self._format_value("Sodium_Milligram", totals, is_mg=True),
+                    "",
+                ),
+            )
+            self._planner_tree_payload[day_id] = {"type": "day", "payload": payload}
+
+            for meal, details in payload.get("meals", {}).items():
+                options = details.get("options", [])
+                if not options:
+                    continue
+                primary = options[0]
+                note = f"{len(options) - 1} alternates" if len(options) > 1 else ""
+                totals = primary.get("totals", {})
+                meal_id = self.planner_tree.insert(
+                    day_id,
+                    tk.END,
+                    text=meal,
+                    values=(
+                        self._format_value("KCAL_Value", totals),
+                        self._format_value("TotalCarb_Gram", totals),
+                        self._format_value("Protein_Gram", totals),
+                        self._format_value("TotalFat_Gram", totals),
+                        self._format_value("FiberTotalDietary_Gram", totals),
+                        self._format_value("SugarTotal_Gram", totals),
+                        self._format_value("Sodium_Milligram", totals, is_mg=True),
+                        note,
+                    ),
+                )
+                self._planner_tree_payload[meal_id] = {"type": "meal", "payload": primary, "target": details.get("target")}
+
+                for item in primary.get("items", []):
+                    nutrients = item.get("nutrients", {})
+                    item_id = self.planner_tree.insert(
+                        meal_id,
+                        tk.END,
+                        text=f"{item.get('servings', 1)}× {item.get('name')}",
+                        values=(
+                            self._format_value("KCAL_Value", nutrients),
+                            self._format_value("TotalCarb_Gram", nutrients),
+                            self._format_value("Protein_Gram", nutrients),
+                            self._format_value("TotalFat_Gram", nutrients),
+                            self._format_value("FiberTotalDietary_Gram", nutrients),
+                            self._format_value("SugarTotal_Gram", nutrients),
+                            self._format_value("Sodium_Milligram", nutrients, is_mg=True),
+                            item.get("allergens", "") or "",
+                        ),
+                    )
+                    self._planner_tree_payload[item_id] = {"type": "item", "payload": item}
+
+        for day_id in self.planner_tree.get_children():
+            self.planner_tree.item(day_id, open=True)
+            for meal_id in self.planner_tree.get_children(day_id):
+                self.planner_tree.item(meal_id, open=True)
+
+    def _format_value(self, key: str, totals: Dict[str, float], is_mg: bool = False) -> str:
+        value = totals.get(key, 0.0)
+        if is_mg:
+            return f"{value:.0f}"
+        if key == "KCAL_Value":
+            return f"{value:.0f}"
+        return f"{value:.1f}"
+
+    def _flatten_plan_rows(self, plan: Dict[str, Dict]) -> List[Dict[str, object]]:
+        rows: List[Dict[str, object]] = []
+        for day, payload in plan.items():
+            for meal, details in payload.get("meals", {}).items():
+                options = details.get("options", [])
+                for idx, option in enumerate(options):
+                    for item in option.get("items", []):
+                        nutrients = item.get("nutrients", {})
+                        rows.append(
+                            {
+                                "day": day,
+                                "meal": meal,
+                                "option_index": idx,
+                                "is_primary": idx == 0,
+                                "item": item.get("name"),
+                                "servings": item.get("servings"),
+                                "kcal": nutrients.get("KCAL_Value", 0.0),
+                                "carb_g": nutrients.get("TotalCarb_Gram", 0.0),
+                                "protein_g": nutrients.get("Protein_Gram", 0.0),
+                                "fat_g": nutrients.get("TotalFat_Gram", 0.0),
+                                "fiber_g": nutrients.get("FiberTotalDietary_Gram", 0.0),
+                                "sugar_g": nutrients.get("SugarTotal_Gram", 0.0),
+                                "sodium_mg": nutrients.get("Sodium_Milligram", 0.0),
+                                "allergens": item.get("allergens"),
+                                "ingredients": item.get("ingredients"),
+                                "score": option.get("score"),
+                            }
+                        )
+        return rows
+
+    def _export_plan_json(self) -> None:
+        if not self._planner_last_plan:
+            messagebox.showinfo("No plan to export", "Run the meal planner first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export meal plan (JSON)",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(self._planner_last_plan, handle, indent=2)
+            messagebox.showinfo("Export complete", f"Saved meal plan to {path}.")
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+
+    def _export_plan_csv(self) -> None:
+        if not self._planner_last_plan:
+            messagebox.showinfo("No plan to export", "Run the meal planner first.")
+            return
+        rows = self._flatten_plan_rows(self._planner_last_plan)
+        if not rows:
+            messagebox.showinfo("Nothing to export", "The current plan is empty.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export meal plan (CSV)",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            pd.DataFrame(rows).to_csv(path, index=False)
+            messagebox.showinfo("Export complete", f"Saved {len(rows)} plan rows to {path}.")
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+
+    def _on_plan_tree_select(self, event: tk.Event) -> None:
+        selection = self.planner_tree.selection()
+        if not selection:
+            return
+        node_id = selection[0]
+        payload = self._planner_tree_payload.get(node_id)
+        if not payload:
+            return
+
+        if payload["type"] == "item":
+            item = payload["payload"]
+            text = [
+                f"{item.get('servings', 1)}× {item.get('name')}",
+                f"Allergens: {item.get('allergens', 'none listed')}",
+                "",
+                "Ingredients:",
+                item.get("ingredients") or "Not provided.",
+            ]
+            self._set_planner_detail_text("\n".join(text))
+        elif payload["type"] == "meal":
+            totals = payload["payload"].get("totals", {})
+            target = payload.get("target", {})
+            lines = ["Meal totals vs target:"]
+            for key in ("KCAL_Value", "Protein_Gram", "TotalCarb_Gram", "TotalFat_Gram"):
+                lines.append(
+                    f"  {key.replace('_', ' ')}: {totals.get(key, 0.0):.1f} (target {target.get(key, 0.0):.1f})"
+                )
+            lines.append("")
+            lines.append(f"Score: {payload['payload'].get('score', 0.0):.3f}")
+            self._set_planner_detail_text("\n".join(lines))
+        else:
+            totals = payload["payload"].get("daily_totals", {})
+            lines = ["Daily totals:"]
+            lines.append(f"  Calories: {totals.get('KCAL_Value', 0.0):.0f} kcal")
+            lines.append(f"  Protein: {totals.get('Protein_Gram', 0.0):.1f} g")
+            lines.append(f"  Carbs: {totals.get('TotalCarb_Gram', 0.0):.1f} g")
+            lines.append(f"  Fat: {totals.get('TotalFat_Gram', 0.0):.1f} g")
+            lines.append(f"  Fiber: {totals.get('FiberTotalDietary_Gram', 0.0):.1f} g")
+            lines.append(f"  Sugar: {totals.get('SugarTotal_Gram', 0.0):.1f} g")
+            lines.append(f"  Sodium: {totals.get('Sodium_Milligram', 0.0):.0f} mg")
+            self._set_planner_detail_text("\n".join(lines))
 
     def _choose_directory(self) -> None:
         selection = filedialog.askdirectory(title="Select menu directory", initialdir=self.menu_dir_var.get())
@@ -492,6 +1032,13 @@ class MenuExplorerApp(tk.Tk):
                 widget.set("All")
             self.allergen_entry.delete(0, tk.END)
             self._set_dashboard_text("Load menus to see summary data.")
+            if hasattr(self, "planner_start_combo"):
+                for combo in (self.planner_start_combo, self.planner_end_combo, self.planner_station_combo):
+                    combo.configure(values=[""])
+                    combo.set("")
+            if hasattr(self, "planner_tree"):
+                self._render_planner_plan({})
+            self.planner_summary_var.set("Load menus to run the meal planner.")
             return
 
         dates = sorted(set(self._menu_df["LabelDate"].dropna()))
@@ -511,6 +1058,19 @@ class MenuExplorerApp(tk.Tk):
         self.station_combo.set("All")
 
         self.allergen_entry.delete(0, tk.END)
+        if hasattr(self, "planner_start_combo"):
+            self.planner_start_combo.configure(values=date_values)
+            self.planner_end_combo.configure(values=date_values)
+            self.planner_start_var.set(date_values[0])
+            self.planner_end_var.set(date_values[-1])
+
+            station_names = set()
+            for column in ("Station", "StationName", "SourceFile", "Concept", "Restaurant"):
+                if column in self._menu_df.columns:
+                    station_names.update(str(val) for val in self._menu_df[column].dropna().unique())
+            planner_station_values = ["All"] + sorted(station_names)
+            self.planner_station_combo.configure(values=planner_station_values)
+            self.planner_station_var.set(planner_station_values[0])
 
     def _update_dashboard_summary(self) -> None:
         if self._menu_df is None or self._menu_df.empty:
